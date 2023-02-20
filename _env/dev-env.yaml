@@ -1,0 +1,40 @@
+name: pvcpy-dev
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python =3.10
+
+  # dev
+  - pylint
+  - flake8
+  - black
+  - pytest
+  - typing_extensions
+
+  # core science packages
+  - numpy
+  - scipy
+
+  # progress monitoring
+  - rich
+  - tqdm
+
+  # dcm requirements
+  - sortedcontainers
+  - pydicom >=2.3
+
+  # mesh requirements
+  - meshio >=5
+  - vtk >=9.2.6
+  - pyvista # helper for vtk
+
+  # plotting and display
+  - matplotlib
+  - colorcet
+  - tabulate
+  - pyvistaqt
+
+  - pip
+  - pip:
+      - python-gdcm # compressed DICOM pixel data
