@@ -1,31 +1,22 @@
 from os import PathLike
-from typing import Union
-from warnings import warn
+from typing import Tuple
 
 from tqdm import tqdm
 import numpy as np
+from numpy.typing import NDArray
 from matplotlib import pyplot as plt
 from scipy.ndimage import binary_erosion
-from vtkmodules.all import (  # pylint: disable = no-name-in-module
-    vtkShepardKernel,
-    vtkStaticPointLocator,
-    vtkDoubleArray,
-    vtkImageData,
-    vtkImageContinuousErode3D,
-    vtkImageMathematics
-)
-import pyvista as pv
+from pyvista import Plotter
+
+# pylint: disable = no-name-in-module
+from vtkmodules.all import vtkExtractCells
 
 from .dcmpy import CtScan, read_ct_scan
 from .adaptors import (
-    convert_3d_img_to_vtkarray,
+    ctscan_to_vtkimage,
     convert_array,
-    convert_id_list,
-    convert_matrix,
-    convert_transform_matrix,
-    convert_points
+    convert_id_list
 )
-
 
 
 __all__ = ["surface_pvc"]
@@ -34,10 +25,8 @@ __all__ = ["surface_pvc"]
 def surface_pvc(
     src_dcm_dir: PathLike,
     mask_dcm_dir: PathLike,
-    data_name: str = "Intensity",
     background: int = None,
     plot_results: bool = True,
-    return_vtk: bool = False,
     verbose: bool = True,
     progress_bar: bool = True
 ):
@@ -62,10 +51,6 @@ def surface_pvc(
     plot_results: bool
         if True then generate histogram of corrections to surface voxels
         and visualize the segmented bone, otherwise do nothing
-
-    return_vtk: bool
-        If True then return the partial volume corrected image
-        as an ImageData object, otherwise return it as a CtScan
 
     verbose: bool
         if True then display metadata regarding the input DICOMs
@@ -95,153 +80,151 @@ def surface_pvc(
     """
     # ------------------------------
     power = 2
-    pvc_data_name = "PVC" + data_name
+    pad = 2
     # -------------------------------
 
-    _check_flags_are_bools(plot_results, return_vtk, verbose, progress_bar)
+    _check_flags_are_bools(plot_results, verbose, progress_bar)
 
-    if (background is not None) and np.isnan(background) and (not return_vtk):
-        background = None
-        warn("NaN cannot be stored in a DICOM. Background set to None.")
+    if (background is not None) and not isinstance(background, int):
+        raise ValueError(
+            "Background is non-integer value. Cannot be stored in DICOM."
+        )
 
     src_dcm = read_ct_scan(src_dcm_dir, binary_data=False)
     mask_dcm = read_ct_scan(mask_dcm_dir, binary_data=True)
-    binary_mask = mask_dcm.pixel_array
+
+    if not src_dcm.orthognal_axes:
+        raise ValueError("DICOM must have orthogonal image axes")
+
+    if not src_dcm.uniform_spacing:
+        raise ValueError("Non-uniform slice spacing not supported by pvcpy.")
 
     if not src_dcm.is_aligned(mask_dcm):
         raise ValueError("Expected source and mask DICOMs to be aligned.")
 
-    src_img = ctscan_to_vtkimage(src_dcm, data_name)
+    hu_data = src_dcm.pixel_array
+    binary_mask = mask_dcm.pixel_array
 
-    # add segmentation mask to source image
-    src_img.GetPointData().AddArray(
-        convert_3d_img_to_vtkarray(binary_mask.astype(dtype=np.uint8), "Mask")
-    )
+    # pad arrays to avoid issues with kernel near the edges
+    hu_data = pad_image(hu_data, pad_width=pad, pad_val=0)
+    binary_mask = pad_image(binary_mask, pad_width=pad, pad_val=0)
 
     # define surface and interior points
-    interior: np.ndarray = binary_erosion(binary_mask).astype(dtype=np.uint8)
-    surface = np.array(binary_mask - interior, dtype=np.uint8)
+    interior: np.ndarray = binary_erosion(binary_mask).astype(dtype=np.int8)
+    surface = np.array(binary_mask - interior)
 
-    src_img.GetPointData().AddArray(
-        convert_3d_img_to_vtkarray(
-            interior.astype(dtype=np.uint8), "Interior"
-        )
-    )
+    # define the interpolation kernel
+    kernel = create_idw_kernel(np.asarray(src_dcm.spacing), power)
 
-    src_img.GetPointData().AddArray(
-        convert_3d_img_to_vtkarray(
-            surface.astype(dtype=np.uint8), "Surface"
-        )
-    )
+    # get array of surface point indexes to perform pvc on
+    surf_ids = np.argwhere(surface == 1)
 
-    # get array of surface point ids to perform pvc on
-    surface = surface.flatten("F")
-    surf_pt_ids = np.squeeze(np.argwhere(surface == 1))
+    # for each surface point apply the kernel to it's
+    # neighborhood to compute the new value
+    # multiply by that neighborhood in the interior mask first though
+    # to set non-internal point weights to zero
+    pvc_data = np.array(hu_data)  # copy hu_data
+    with tqdm(surf_ids, desc="PVC") if progress_bar else surf_ids as pbar:
+        for pt_loc in pbar:
+            wgts = get_neighborhood(pt_loc, interior)*kernel  # mask
+            if np.count_nonzero(wgts) != 0:
+                wgts /= np.sum(wgts)  # normalize weights
+                idw_val = np.sum(wgts * get_neighborhood(pt_loc, hu_data))
+                i, j, k = pt_loc[0], pt_loc[1], pt_loc[2]
+                pvc_data[i, j, k] = max(idw_val, pvc_data[i, j, k])
 
-    # get set of interior values to interpolate from (set -> faster search)
-    interior = interior.flatten("F")
-    interior_pt_ids = set(np.squeeze(np.argwhere(interior == 1)))
+    if background is not None:  # set background voxel values
+        pvc_data = np.where(binary_mask, pvc_data, background)
 
-    # get array of intensity data
-    intensity: np.ndarray = convert_array(
-        src_img.GetPointData().GetAbstractArray(data_name)
-    )
+    print("Reduced Intensity:", np.count_nonzero(pvc_data - hu_data < 0))
 
-    # use static point locator
-    locator = vtkStaticPointLocator()
-    locator.SetDataSet(src_img)
-    locator.Update()
-
-    # create interpolation kernel
-    idw_kernel = vtkShepardKernel()
-    idw_kernel.SetPowerParameter(power)
-    idw_kernel.NormalizeWeightsOn()
-    idw_kernel.Initialize(locator,
-                          src_img,
-                          src_img.GetPointData())
-    idw_kernel.RequiresInitializationOff()  # manually intialized
-
-    with tqdm(surf_pt_ids, desc="PVC") if progress_bar else surf_pt_ids as pbar:
-        for pt_id in pbar:
-            # get connected interior points
-            connected_pt_ids = src_img.get_connected_points(pt_id)
-            basis_pt_ids = convert_id_list(
-                [idx for idx in connected_pt_ids if idx in interior_pt_ids]
-            )
-
-            # interpolate from connected interior points
-            if len(basis_pt_ids) > 0:
-                point = src_img.get_point(pt_id)
-                wgts = vtkDoubleArray()
-                idw_kernel.ComputeWeights(
-                    point,          # point to interpolate onto
-                    basis_pt_ids,   # points to interpolate from
-                    None,           # set probability function to 1's
-                    wgts            # interpolation weights
-                )
-                vals = intensity[convert_id_list(basis_pt_ids)]
-                idw_val = round(np.sum(vals * wgts))  # DICOMs require ints
-                if idw_val > intensity[pt_id]:        # update val if greater
-                    intensity[pt_id] = idw_val
-
-    src_img.point_data[pvc_data_name] = intensity
-
-    # apply background value is supplied one
-    if background is not None:
-        if not isinstance(background, int) and not np.isnan(background):
-            background = round(background)
-        mask = src_img.point_data["Mask"]
-        pvc_intensity = src_img.point_data[pvc_data_name]
-        pvc_intensity = np.where(mask == 0, background, pvc_intensity)
-        src_img.point_data[pvc_data_name] = pvc_intensity
+    # crop arrays to remove padding
+    pvc_data = remove_padding(pvc_data, pad_width=pad)
+    src_dcm.pixel_array = pvc_data
 
     if plot_results:
-        _plot_histo(src_img, data_name, pvc_data_name)
-        _plot_meshes(src_img, data_name, pvc_data_name)
-
-    # return result
-    if not return_vtk:
-        src_dcm.pixel_array = src_img.get_3d_point_data(pvc_data_name)
-        return src_dcm
-
-    return src_img
-
-def ctscan_to_vtkimage(ctscan: CtScan, data_name: str):
-    """Convert a CtScan instance into a vtkImageData instance."""
-    vtkarr = convert_3d_img_to_vtkarray(ctscan.pixel_array, data_name)
-
-    img = vtkImageData()
-    img.SetOrigin(ctscan.origin)
-    img.SetDirectionMatrix(convert_matrix(ctscan.direction_matrix))
-    img.SetDimensions(ctscan.dimensions)
-    img.SetSpacing(ctscan.spacing)
-    img.GetPointData().AddArray(vtkarr)
-    return img
+        hu_data = remove_padding(hu_data, pad_width=pad)
+        surface = remove_padding(surface, pad_width=pad)
+        binary_mask = remove_padding(binary_mask, pad_width=pad)
+        _plot_histo(hu_data, pvc_data, surface)
+        _plot_meshes(src_dcm, hu_data, pvc_data, binary_mask)
+        plt.show()  # hold figures open until they are closed.
+    return src_dcm
 
 
-# def erode_vtkimage(img: vtkImageData, arr_name: str) -> vtkImageData:
-#     """Erode the point data array specified by arr_name."""
-#     img.GetPointData().SetActiveScalars(arr_name)
-
-#     alg = vtkImageContinuousErode3D()
-#     alg.SetInputData(img)
-#     alg.SetKernelSize(3, 3, 3)
-#     alg.Update()
-#     return alg.GetOutput()
+def pad_image(img: NDArray, pad_width: int, pad_val: float = 0):
+    """Pad all axes before and after to width.
+    So pad_width of 2 expands a dimension by 4."""
+    widths = tuple((pad_width, pad_width) for _ in range(img.ndim))
+    return np.pad(img, widths, "constant", constant_values=pad_val)
 
 
+def remove_padding(img: NDArray, pad_width: int):
+    """Removes padding from beginning and end of each axis."""
+    return img[pad_width:-pad_width, pad_width:-pad_width, pad_width:-pad_width]
 
-def _plot_histo(src_img: vtkImageData, data_name: str, pvc_data_name: str):
+
+def get_neighborhood(loc: Tuple[int, int, int], img: NDArray):
+    """Get the 3x3 cube of voxels centered on the point at loc."""
+    # nbrs = np.empty((3,3,3))
+    # for i in range(-1, 2, 1):
+    #     for j in range(-1, 2, 1):
+    #         for k in range(-1, 2, 1):
+    #             ii, jj, kk = loc + np.array([i, j, k])
+    #             try:
+    #                 nbrs[i, j, k] = img[ii, jj, kk]
+    #             except IndexError:
+    #                 nbrs[ii, jj, kk] = 0
+    # return nbrs
+    idx = []
+    for i, dim in enumerate(img.shape):
+        start = max(0, loc[i]-1)
+        stop = min(dim, loc[i]+2)
+        idx.append(slice(start, stop))
+    nbrs = img[idx[0], idx[1], idx[2]]
+    if nbrs.shape == (3, 3, 3):
+        return nbrs
+    raise RuntimeError("Insufficient padding of image.")
+
+
+def create_idw_kernel(spacing: NDArray, power: float):
+    """Create IDW kernel for image grid."""
+    ddi = spacing[0]
+    ddj = spacing[1]
+    ddk = spacing[2]
+    ddij = np.linalg.norm([ddi, ddj])
+    ddik = np.linalg.norm([ddi, ddk])
+    ddjk = np.linalg.norm([ddj, ddk])
+    ddijk = np.linalg.norm([ddi, ddj, ddk])
+
+    kernel = np.empty((3, 3, 3))
+    kernel[:, :, 0] = np.array(
+        [[ddijk, ddik, ddijk],
+         [ddjk, ddk, ddjk],
+         [ddijk, ddik, ddijk]]
+    )
+    kernel[:, :, 1] = np.array(
+        [[ddij, ddi, ddij],
+         [ddj, 1, ddj],
+         [ddij, ddi, ddij]]
+    )
+    kernel[:, :, 2] = kernel[:, :, 0]
+    kernel = 1 / np.power(kernel, power)
+    kernel = np.where(np.isnan(kernel), 0, kernel)  # center point to zero
+    return kernel
+
+
+def _plot_histo(
+    hu_data: NDArray,
+    pvc_data: NDArray,
+    surface: NDArray
+):
     """Description:
     Creates and plots a histogram of the magnitude of HU correction at
     each surface voxel
     """
-    surface = src_img.point_data["Surface"]
-    intensity = src_img.point_data[data_name]
-    pvc_intensity = src_img.point_data[pvc_data_name]
-
     # get change in intensity values
-    pvc_diff = pvc_intensity - intensity
+    pvc_diff = pvc_data - hu_data
     pvc_diff = pvc_diff[surface == 1]
 
     max_diff = np.nanmax(pvc_diff)
@@ -275,24 +258,43 @@ def _plot_histo(src_img: vtkImageData, data_name: str, pvc_data_name: str):
         fig_manager.window.showMaximized()
     elif back_end == "wxAgg":
         fig_manager.frame.Maximize(True)
-    plt.show()
+    plt.show(block=False)
 
 
-def _plot_meshes(src_img: vtkImageData, data_name: str, pvc_data_name: str):
-    """Plot before and after visualizaiton of segmented voxels"""
-    src_mesh = src_img.points_to_cells()
-    bone_mesh = src_mesh.extract_cells(src_mesh.cell_data["Mask"])
+def _plot_meshes(
+    src_dcm: CtScan,
+    hu_data: NDArray,
+    pvc_data: NDArray,
+    mask: NDArray
+):
+    """Plot before and after visualization of segmented voxels"""
+    mesh = ctscan_to_vtkimage(src_dcm, as_cells=True)
+    mesh.GetCellData().AddArray(
+        convert_array(hu_data.flatten("F"), "Raw HU-Intensity")
+    )
+    mesh.GetCellData().AddArray(
+        convert_array(pvc_data.flatten("F"), "PVC HU-Intensity",)
+    )
+    mask = mask.flatten("F")
+    mask = np.squeeze(np.argwhere(mask == 1))
+    mask_ids = convert_id_list(mask)
+
+    extractor = vtkExtractCells()
+    extractor.SetInputData(mesh)
+    extractor.SetCellList(mask_ids)
+    extractor.Update()
+    mesh = extractor.GetOutput()
 
     sargs = dict(fmt="%.0f")
 
-    plotter = pv.Plotter(shape=(1, 2))
+    plotter = Plotter(shape=(1, 2))
     plotter.subplot(0, 0)
     plotter.add_title("Original Intensity")
-    plotter.add_mesh(bone_mesh, scalars=data_name, scalar_bar_args=sargs)
+    plotter.add_mesh(mesh, scalars="Raw HU-Intensity", scalar_bar_args=sargs)
 
     plotter.subplot(0, 1)
     plotter.add_title("PVC Intensity")
-    plotter.add_mesh(bone_mesh, scalars=pvc_data_name, scalar_bar_args=sargs)
+    plotter.add_mesh(mesh, scalars="PVC HU-Intensity", scalar_bar_args=sargs)
     plotter.show()
 
 

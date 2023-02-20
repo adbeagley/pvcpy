@@ -3,7 +3,7 @@ from typing import Union, Optional
 from warnings import warn
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import NDArray, ArrayLike
 from vtkmodules.all import (  # pylint: disable = no-name-in-module
     vtkMatrix3x3,
     vtkMatrix4x4,
@@ -14,6 +14,7 @@ from vtkmodules.all import (  # pylint: disable = no-name-in-module
     vtkStringArray,
     vtkCharArray,
     vtkPoints,
+    vtkImageData
 )
 from vtkmodules.util.numpy_support import (
     vtk_to_numpy,
@@ -22,8 +23,10 @@ from vtkmodules.util.numpy_support import (
     VTK_ID_TYPE_SIZE
 )
 
+from .dcmpy import CtScan
+
 __all__ = [
-    "convert_3d_img_to_vtkarray",
+    "ctscan_to_vtkimage",
     "convert_points",
     "convert_array",
     "convert_matrix",
@@ -44,30 +47,23 @@ def _get_vtk_id_type():
 IdType = _get_vtk_id_type()
 
 
-def convert_3d_img_to_vtkarray(
-    img: NDArray,
-    name: Optional[str] = None,
-    deep: bool = False,
-):
-    """Convert 3d numpy image to a flattened vtkDataArray.
+def ctscan_to_vtkimage(ctscan: CtScan, as_cells: bool = False):
+    """Create a vtkImageData instance that aligns with the CtScan."""
+    spacing = np.asarray(ctscan.spacing)
+    d_matrix = ctscan.direction_matrix
+    if as_cells:
+        origin = np.asarray(ctscan.origin) - np.matmul(d_matrix, spacing)/2
+        dims = np.asarray(ctscan.dimensions) + 1
+    else:
+        origin = np.asarray(ctscan.origin)
+        dims = np.asarray(ctscan.dimensions)
 
-    Parameters:
-    ------------
-    img: NDArray
-        A 3-d ndarray with pixel data.
-
-    Returns:
-    --------
-    vtkarray: vtkDataArray
-        vtkDataArray of the appropriate type containing the
-        flattened pixel data.
-    """
-    img = np.asarray(img)
-    if img.ndim != 3:
-        raise ValueError(
-            f"Expected a 3-d image, not a {img.ndim}-d image as input."
-        )
-    return convert_array(img.flatten("F"), name=name, deep=deep)
+    img = vtkImageData()
+    img.SetOrigin(origin)
+    img.SetDirectionMatrix(convert_matrix(d_matrix))
+    img.SetDimensions(dims)
+    img.SetSpacing(spacing)
+    return img
 
 
 def convert_points(
@@ -328,7 +324,9 @@ def convert_id_list(id_list: Union[vtkIdList, NDArray[np.integer]]):
         if not np.issubdtype(id_list.dtype, np.integer):
             raise TypeError("Expected an array of integer ids.")
         if id_list.ndim != 1:
-            raise ValueError("Expected a 1D array of integers ids.")
+            raise ValueError(
+                f"Expected a 1D array, not a {id_list.ndim}D array."
+            )
         result = vtkIdList()
         for val in id_list:
             result.InsertNextId(val)
@@ -337,7 +335,7 @@ def convert_id_list(id_list: Union[vtkIdList, NDArray[np.integer]]):
 
 
 def convert_array(
-    arr: Union[np.ArrayLike, vtkDataArray],
+    arr: Union[ArrayLike, vtkDataArray],
     name: str = None,
     deep: bool = False,
     array_type: Optional[int] = None,

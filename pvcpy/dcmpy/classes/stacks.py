@@ -349,12 +349,17 @@ class CtScan(ImgScan):
 
     @property
     def pixel_array(self):
-        """Description:
-        Returns uncompressed and rescaled pixel data for the DICOM sequence
+        """Uncompressed and rescaled pixel data for the DICOM sequence as
+        a 3-d NDArray.
 
         Notes:
-        ------
-        Computed each time the property is called
+        -----
+        Each time the array is returned it is reconstructed from slice data.
+
+        When setting the array it is compressed to a byte string using C
+        ordering so input should use matrix indexing(i traverses image rows,
+        j traverses image columns). The UID metadata for DICOM slices is
+        updated whenever the array is set.
         """
         dicom_img_3d = np.empty(self.dimensions, dtype=np.float64)
         for k in range(self.n_slices):
@@ -363,21 +368,17 @@ class CtScan(ImgScan):
 
     @pixel_array.setter
     def pixel_array(self, data: np.ndarray):
-        """Description:
-        Updates pixel data in the DICOM sequence to equal img_data_3d
-        and updates required UID metadata.
-
-        Parameters:
-        ------------
-        img_data_3d: ndarry
-            numpy array with same shape as DICOM sequence extent
-            that contains the pixel values
+        """Uncompressed and rescaled pixel data for the DICOM sequence as
+        a 3-d NDArray.
 
         Notes:
         -----
-        Compresses to byte string using C ordering so input should use
-        matrix indexing
-        (i traverses image rows, j traverses image columns)
+        Each time the array is returned it is reconstructed from slice data.
+
+        When setting the array it is compressed to a byte string using C
+        ordering so input should use matrix indexing(i traverses image rows,
+        j traverses image columns). The UID metadata for DICOM slices is
+        updated whenever the array is set.
         """
         if not isinstance(data, np.ndarray):
             raise TypeError("pixel data must be a numpy array")
@@ -406,7 +407,7 @@ class CtScan(ImgScan):
 
         Returns:
         --------
-        array_image: ndarry
+        array_image: ndarray
             array containing the values at each pixel
 
         Notes:
