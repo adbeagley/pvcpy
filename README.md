@@ -3,4 +3,4 @@ Python code to take an input dicom and a mask dicom to determine the voxels maki
 
 Make sure that the dicoms are stack data with 1 slice per file.
 
-For details on the algorithm and its validation see the working paper "Effects of Material Mapping Agnostic Partial Volume Correction for Subject Specific Finite Elements Simulations" available on [arXiv](https://arxiv.org/)
+For details on the algorithm and its validation see the working paper "Effects of Material Mapping Agnostic Partial Volume Correction for Subject Specific Finite Elements Simulations" available on [arXiv]([https://arxiv.org/](https://arxiv.org/abs/2309.01769)https://arxiv.org/abs/2309.01769)
