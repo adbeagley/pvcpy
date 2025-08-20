@@ -12,11 +12,7 @@ from pyvista import Plotter
 from vtkmodules.all import vtkExtractCells
 
 from .dcmpy import CtScan, read_ct_scan
-from .adaptors import (
-    ctscan_to_vtkimage,
-    convert_array,
-    convert_id_list
-)
+from .adaptors import ctscan_to_vtkimage, convert_array, convert_id_list
 
 
 __all__ = ["surface_pvc"]
@@ -28,7 +24,7 @@ def surface_pvc(
     background: int = None,
     plot_results: bool = True,
     verbose: bool = True,
-    progress_bar: bool = True
+    progress_bar: bool = True,
 ):
     """Description:
     Algorithm to perform partial volume
@@ -86,10 +82,10 @@ def surface_pvc(
     _check_flags_are_bools(plot_results, verbose, progress_bar)
 
     if (background is not None) and not isinstance(background, int):
-        raise ValueError(
-            "Background is non-integer value. Cannot be stored in DICOM."
-        )
+        raise ValueError("Background is non-integer value. Cannot be stored in DICOM.")
 
+    if progress_bar:
+        print("Reading input DICOM sequences...")
     src_dcm = read_ct_scan(src_dcm_dir, binary_data=False)
     mask_dcm = read_ct_scan(mask_dcm_dir, binary_data=True)
 
@@ -102,6 +98,8 @@ def surface_pvc(
     if not src_dcm.is_aligned(mask_dcm):
         raise ValueError("Expected source and mask DICOMs to be aligned.")
 
+    if progress_bar:
+        print("Preprocessing images...")
     hu_data = src_dcm.pixel_array
     binary_mask = mask_dcm.pixel_array
 
@@ -126,7 +124,7 @@ def surface_pvc(
     pvc_data = np.array(hu_data)  # copy hu_data
     with tqdm(surf_ids, desc="PVC") if progress_bar else surf_ids as pbar:
         for pt_loc in pbar:
-            wgts = get_neighborhood(pt_loc, interior)*kernel  # mask
+            wgts = get_neighborhood(pt_loc, interior) * kernel  # mask
             if np.count_nonzero(wgts) != 0:
                 wgts /= np.sum(wgts)  # normalize weights
                 idw_val = np.sum(wgts * get_neighborhood(pt_loc, hu_data))
@@ -178,8 +176,8 @@ def get_neighborhood(loc: Tuple[int, int, int], img: NDArray):
     # return nbrs
     idx = []
     for i, dim in enumerate(img.shape):
-        start = max(0, loc[i]-1)
-        stop = min(dim, loc[i]+2)
+        start = max(0, loc[i] - 1)
+        stop = min(dim, loc[i] + 2)
         idx.append(slice(start, stop))
     nbrs = img[idx[0], idx[1], idx[2]]
     if nbrs.shape == (3, 3, 3):
@@ -199,26 +197,16 @@ def create_idw_kernel(spacing: NDArray, power: float):
 
     kernel = np.empty((3, 3, 3))
     kernel[:, :, 0] = np.array(
-        [[ddijk, ddik, ddijk],
-         [ddjk, ddk, ddjk],
-         [ddijk, ddik, ddijk]]
+        [[ddijk, ddik, ddijk], [ddjk, ddk, ddjk], [ddijk, ddik, ddijk]]
     )
-    kernel[:, :, 1] = np.array(
-        [[ddij, ddi, ddij],
-         [ddj, 1, ddj],
-         [ddij, ddi, ddij]]
-    )
+    kernel[:, :, 1] = np.array([[ddij, ddi, ddij], [ddj, 1, ddj], [ddij, ddi, ddij]])
     kernel[:, :, 2] = kernel[:, :, 0]
     kernel = 1 / np.power(kernel, power)
     kernel = np.where(np.isnan(kernel), 0, kernel)  # center point to zero
     return kernel
 
 
-def _plot_histo(
-    hu_data: NDArray,
-    pvc_data: NDArray,
-    surface: NDArray
-):
+def _plot_histo(hu_data: NDArray, pvc_data: NDArray, surface: NDArray):
     """Description:
     Creates and plots a histogram of the magnitude of HU correction at
     each surface voxel
@@ -233,27 +221,28 @@ def _plot_histo(
     bin_range = (min_diff, max_diff)
     n_voxels = len(pvc_diff)
 
-    vals, bin_edges = np.histogram(
-        pvc_diff, bins=n_bins, range=bin_range, density=True)
+    vals, bin_edges = np.histogram(pvc_diff, bins=n_bins, range=bin_range, density=True)
     vals = vals * 100  # convert to percentage of voxels with this change
 
     # exclude points with zero change to avoid poor y-axis scale
     fig, axs = plt.subplots(2)
-    fig.suptitle('PVC \u0394HU for Surface Voxels')  #
+    fig.suptitle("PVC \u0394HU for Surface Voxels")  #
     axs[0].bar(bin_edges[1:-1], vals[1:], width=1)
-    axs[0].set(ylabel='Percentage of Voxels')
+    axs[0].set(ylabel="Percentage of Voxels")
     axs[1].bar(bin_edges[1:-1], vals[1:] * n_voxels / 100, width=1)
-    axs[1].set(ylabel='Number of Voxels')
-    axs[1].set(xlabel='|\u0394HU| Correction')
+    axs[1].set(ylabel="Number of Voxels")
+    axs[1].set(xlabel="|\u0394HU| Correction")
     plt.tight_layout()
-    msg = (f"Voxels with no correction: {int(vals[0] * n_voxels / 100)}"
-           f" or {vals[0]:0.2f}%")
+    msg = (
+        f"Voxels with no correction: {int(vals[0] * n_voxels / 100)}"
+        f" or {vals[0]:0.2f}%"
+    )
     plt.figtext(0.45, 0.02, msg)
 
     back_end = plt.get_backend()
     fig_manager = plt.get_current_fig_manager()
     if back_end == "TkAgg":
-        fig_manager.window.state('zoomed')
+        fig_manager.window.state("zoomed")
     elif back_end == "QT4Agg":
         fig_manager.window.showMaximized()
     elif back_end == "wxAgg":
@@ -261,19 +250,15 @@ def _plot_histo(
     plt.show(block=False)
 
 
-def _plot_meshes(
-    src_dcm: CtScan,
-    hu_data: NDArray,
-    pvc_data: NDArray,
-    mask: NDArray
-):
+def _plot_meshes(src_dcm: CtScan, hu_data: NDArray, pvc_data: NDArray, mask: NDArray):
     """Plot before and after visualization of segmented voxels"""
     mesh = ctscan_to_vtkimage(src_dcm, as_cells=True)
+    mesh.GetCellData().AddArray(convert_array(hu_data.flatten("F"), "Raw HU-Intensity"))
     mesh.GetCellData().AddArray(
-        convert_array(hu_data.flatten("F"), "Raw HU-Intensity")
-    )
-    mesh.GetCellData().AddArray(
-        convert_array(pvc_data.flatten("F"), "PVC HU-Intensity",)
+        convert_array(
+            pvc_data.flatten("F"),
+            "PVC HU-Intensity",
+        )
     )
     mask = mask.flatten("F")
     mask = np.squeeze(np.argwhere(mask == 1))
